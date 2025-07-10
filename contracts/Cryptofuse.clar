@@ -14,9 +14,18 @@
 (define-constant err-insufficient-funds (err u107))
 (define-constant err-bounty-expired (err u108))
 (define-constant err-invalid-solution (err u109))
+(define-constant err-collaboration-closed (err u110))
+(define-constant err-invalid-contribution (err u111))
+(define-constant err-already-voted (err u112))
+(define-constant err-insufficient-votes (err u113))
+(define-constant err-invalid-reward-share (err u114))
+(define-constant err-contribution-not-found (err u115))
+(define-constant err-self-vote (err u116))
 
 (define-data-var bounty-counter uint u0)
 (define-data-var contract-fee-rate uint u250)
+(define-data-var contribution-counter uint u0)
+(define-data-var min-votes-required uint u3)
 
 (define-map bounties
   { bounty-id: uint }
@@ -40,6 +49,41 @@
 (define-map bounty-attempts
   { bounty-id: uint, user: principal }
   { attempts: uint, last-attempt: uint }
+)
+
+(define-map bounty-contributions
+  { contribution-id: uint }
+  {
+    bounty-id: uint,
+    contributor: principal,
+    content: (string-ascii 300),
+    contribution-type: (string-ascii 20),
+    reward-share: uint,
+    votes-for: uint,
+    votes-against: uint,
+    approved: bool,
+    created-at: uint
+  }
+)
+
+(define-map contribution-votes
+  { contribution-id: uint, voter: principal }
+  { vote: bool, voted-at: uint }
+)
+
+(define-map bounty-collaborators
+  { bounty-id: uint, collaborator: principal }
+  { total-contributions: uint, total-reward-share: uint }
+)
+
+(define-map bounty-collaboration-settings
+  { bounty-id: uint }
+  {
+    collaboration-enabled: bool,
+    max-collaborators: uint,
+    min-contribution-votes: uint,
+    collaboration-deadline: uint
+  }
 )
 
 (define-public (create-bounty 
@@ -256,4 +300,234 @@
 
 (define-read-only (calculate-solution-hash (solution (string-ascii 200)))
   (sha256 (unwrap-panic (to-consensus-buff? solution)))
+)
+
+(define-public (enable-bounty-collaboration 
+  (bounty-id uint)
+  (max-collaborators uint)
+  (collaboration-deadline uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    (asserts! (not (get solved bounty)) err-already-solved)
+    (asserts! (> max-collaborators u0) err-invalid-amount)
+    (asserts! (and (> collaboration-deadline current-block) (< collaboration-deadline (get deadline bounty))) err-invalid-deadline)
+    
+    (map-set bounty-collaboration-settings
+      { bounty-id: bounty-id }
+      {
+        collaboration-enabled: true,
+        max-collaborators: max-collaborators,
+        min-contribution-votes: (var-get min-votes-required),
+        collaboration-deadline: collaboration-deadline
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (submit-contribution 
+  (bounty-id uint)
+  (content (string-ascii 300))
+  (contribution-type (string-ascii 20))
+  (reward-share uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (collaboration-settings (unwrap! (map-get? bounty-collaboration-settings { bounty-id: bounty-id }) err-collaboration-closed))
+      (current-block stacks-block-height)
+      (contribution-id (+ (var-get contribution-counter) u1))
+      (collaborator-data (default-to { total-contributions: u0, total-reward-share: u0 }
+        (map-get? bounty-collaborators { bounty-id: bounty-id, collaborator: tx-sender })))
+    )
+    (asserts! (get collaboration-enabled collaboration-settings) err-collaboration-closed)
+    (asserts! (not (get solved bounty)) err-already-solved)
+    (asserts! (< current-block (get collaboration-deadline collaboration-settings)) err-collaboration-closed)
+    (asserts! (> (len content) u0) err-invalid-contribution)
+    (asserts! (and (> reward-share u0) (<= reward-share u50)) err-invalid-reward-share)
+    (asserts! (not (is-eq tx-sender (get creator bounty))) err-unauthorized)
+    
+    (map-set bounty-contributions
+      { contribution-id: contribution-id }
+      {
+        bounty-id: bounty-id,
+        contributor: tx-sender,
+        content: content,
+        contribution-type: contribution-type,
+        reward-share: reward-share,
+        votes-for: u0,
+        votes-against: u0,
+        approved: false,
+        created-at: current-block
+      }
+    )
+    
+    (map-set bounty-collaborators
+      { bounty-id: bounty-id, collaborator: tx-sender }
+      {
+        total-contributions: (+ (get total-contributions collaborator-data) u1),
+        total-reward-share: (+ (get total-reward-share collaborator-data) reward-share)
+      }
+    )
+    
+    (var-set contribution-counter contribution-id)
+    (ok contribution-id)
+  )
+)
+
+(define-public (vote-on-contribution (contribution-id uint) (vote bool))
+  (let
+    (
+      (contribution (unwrap! (map-get? bounty-contributions { contribution-id: contribution-id }) err-contribution-not-found))
+      (bounty (unwrap! (map-get? bounties { bounty-id: (get bounty-id contribution) }) err-not-found))
+      (existing-vote (map-get? contribution-votes { contribution-id: contribution-id, voter: tx-sender }))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (not (is-eq tx-sender (get contributor contribution))) err-self-vote)
+    (asserts! (not (get solved bounty)) err-already-solved)
+    
+    (map-set contribution-votes
+      { contribution-id: contribution-id, voter: tx-sender }
+      { vote: vote, voted-at: current-block }
+    )
+    
+    (if vote
+      (map-set bounty-contributions
+        { contribution-id: contribution-id }
+        (merge contribution { votes-for: (+ (get votes-for contribution) u1) })
+      )
+      (map-set bounty-contributions
+        { contribution-id: contribution-id }
+        (merge contribution { votes-against: (+ (get votes-against contribution) u1) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (approve-contribution (contribution-id uint))
+  (let
+    (
+      (contribution (unwrap! (map-get? bounty-contributions { contribution-id: contribution-id }) err-contribution-not-found))
+      (bounty (unwrap! (map-get? bounties { bounty-id: (get bounty-id contribution) }) err-not-found))
+      (collaboration-settings (unwrap! (map-get? bounty-collaboration-settings { bounty-id: (get bounty-id contribution) }) err-collaboration-closed))
+      (min-votes (get min-contribution-votes collaboration-settings))
+      (total-votes (+ (get votes-for contribution) (get votes-against contribution)))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    (asserts! (not (get approved contribution)) err-already-solved)
+    (asserts! (>= total-votes min-votes) err-insufficient-votes)
+    (asserts! (> (get votes-for contribution) (get votes-against contribution)) err-invalid-contribution)
+    
+    (map-set bounty-contributions
+      { contribution-id: contribution-id }
+      (merge contribution { approved: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (distribute-collaborative-rewards (bounty-id uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (collaboration-settings (unwrap! (map-get? bounty-collaboration-settings { bounty-id: bounty-id }) err-collaboration-closed))
+      (total-reward (get reward-amount bounty))
+      (fee-amount (/ (* total-reward (var-get contract-fee-rate)) u10000))
+      (collaborative-pool (/ (- total-reward fee-amount) u2))
+      (solver-reward (- total-reward fee-amount collaborative-pool))
+    )
+    (asserts! (get solved bounty) err-not-found)
+    (asserts! (get collaboration-enabled collaboration-settings) err-collaboration-closed)
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    
+    (try! (as-contract (stx-transfer? solver-reward tx-sender (unwrap-panic (get solver bounty)))))
+    (try! (as-contract (stx-transfer? fee-amount tx-sender contract-owner)))
+    
+    (ok collaborative-pool)
+  )
+)
+
+(define-public (claim-collaboration-reward (bounty-id uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (collaborator-data (unwrap! (map-get? bounty-collaborators { bounty-id: bounty-id, collaborator: tx-sender }) err-not-found))
+      (total-reward (get reward-amount bounty))
+      (fee-amount (/ (* total-reward (var-get contract-fee-rate)) u10000))
+      (collaborative-pool (/ (- total-reward fee-amount) u2))
+      (collaborator-reward (/ (* collaborative-pool (get total-reward-share collaborator-data)) u100))
+    )
+    (asserts! (get solved bounty) err-not-found)
+    (asserts! (> (get total-reward-share collaborator-data) u0) err-invalid-reward-share)
+    
+    (map-delete bounty-collaborators { bounty-id: bounty-id, collaborator: tx-sender })
+    (try! (as-contract (stx-transfer? collaborator-reward tx-sender tx-sender)))
+    
+    (ok collaborator-reward)
+  )
+)
+
+(define-public (set-min-votes-required (new-min-votes uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= new-min-votes u1) (<= new-min-votes u10)) err-invalid-amount)
+    (var-set min-votes-required new-min-votes)
+    (ok true)
+  )
+)
+
+(define-read-only (get-contribution (contribution-id uint))
+  (map-get? bounty-contributions { contribution-id: contribution-id })
+)
+
+(define-read-only (get-collaboration-settings (bounty-id uint))
+  (map-get? bounty-collaboration-settings { bounty-id: bounty-id })
+)
+
+(define-read-only (get-collaborator-data (bounty-id uint) (collaborator principal))
+  (map-get? bounty-collaborators { bounty-id: bounty-id, collaborator: collaborator })
+)
+
+(define-read-only (get-contribution-vote (contribution-id uint) (voter principal))
+  (map-get? contribution-votes { contribution-id: contribution-id, voter: voter })
+)
+
+(define-read-only (get-contribution-count)
+  (var-get contribution-counter)
+)
+
+(define-read-only (get-min-votes-required)
+  (var-get min-votes-required)
+)
+
+(define-read-only (is-collaboration-enabled (bounty-id uint))
+  (match (map-get? bounty-collaboration-settings { bounty-id: bounty-id })
+    settings (get collaboration-enabled settings)
+    false
+  )
+)
+
+(define-read-only (calculate-collaborator-reward (bounty-id uint) (collaborator principal))
+  (match (map-get? bounty-collaborators { bounty-id: bounty-id, collaborator: collaborator })
+    collaborator-data
+      (match (map-get? bounties { bounty-id: bounty-id })
+        bounty
+          (let
+            (
+              (total-reward (get reward-amount bounty))
+              (fee-amount (/ (* total-reward (var-get contract-fee-rate)) u10000))
+              (collaborative-pool (/ (- total-reward fee-amount) u2))
+              (reward-share (get total-reward-share collaborator-data))
+            )
+            (some (/ (* collaborative-pool reward-share) u100))
+          )
+        none
+      )
+    none
+  )
 )
