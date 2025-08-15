@@ -21,11 +21,22 @@
 (define-constant err-invalid-reward-share (err u114))
 (define-constant err-contribution-not-found (err u115))
 (define-constant err-self-vote (err u116))
+(define-constant err-escalation-not-enabled (err u117))
+(define-constant err-invalid-escalation-type (err u118))
+(define-constant err-escalation-limit-reached (err u119))
+(define-constant err-invalid-escalation-params (err u120))
+(define-constant err-insufficient-escalation-funds (err u121))
+
+;; Escalation type constants
+(define-constant escalation-linear u1)
+(define-constant escalation-exponential u2)
+(define-constant escalation-stepped u3)
 
 (define-data-var bounty-counter uint u0)
 (define-data-var contract-fee-rate uint u250)
 (define-data-var contribution-counter uint u0)
 (define-data-var min-votes-required uint u3)
+(define-data-var max-escalation-multiplier uint u500) ;; 5x maximum escalation
 
 (define-map bounties
   { bounty-id: uint }
@@ -83,6 +94,31 @@
     max-collaborators: uint,
     min-contribution-votes: uint,
     collaboration-deadline: uint
+  }
+)
+
+;; Reward escalation data structures
+(define-map bounty-escalation-settings
+  { bounty-id: uint }
+  {
+    escalation-enabled: bool,
+    escalation-type: uint, ;; 1=linear, 2=exponential, 3=stepped
+    escalation-rate: uint, ;; percentage increase per interval
+    escalation-interval: uint, ;; blocks between escalations
+    max-reward: uint, ;; maximum reward cap
+    escalation-fund: uint, ;; available funds for escalation
+    last-escalation-block: uint
+  }
+)
+
+;; Track escalation history for analytics
+(define-map escalation-history
+  { bounty-id: uint, escalation-number: uint }
+  {
+    previous-reward: uint,
+    new-reward: uint,
+    escalation-block: uint,
+    escalation-type: uint
   }
 )
 
@@ -531,3 +567,283 @@
     none
   )
 )
+
+;; Dynamic Reward Escalation Functions
+
+(define-public (setup-bounty-escalation
+  (bounty-id uint)
+  (escalation-type uint)
+  (escalation-rate uint) 
+  (escalation-interval uint)
+  (max-reward uint)
+  (escalation-fund uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    (asserts! (not (get solved bounty)) err-already-solved)
+    (asserts! (or (is-eq escalation-type escalation-linear) 
+                  (or (is-eq escalation-type escalation-exponential) 
+                      (is-eq escalation-type escalation-stepped))) err-invalid-escalation-type)
+    (asserts! (and (> escalation-rate u0) (<= escalation-rate u100)) err-invalid-escalation-params)
+    (asserts! (> escalation-interval u0) err-invalid-escalation-params)
+    (asserts! (> max-reward (get reward-amount bounty)) err-invalid-escalation-params)
+    (asserts! (>= (stx-get-balance tx-sender) escalation-fund) err-insufficient-escalation-funds)
+    
+    ;; Transfer escalation funds to contract
+    (try! (stx-transfer? escalation-fund tx-sender (as-contract tx-sender)))
+    
+    (map-set bounty-escalation-settings
+      { bounty-id: bounty-id }
+      {
+        escalation-enabled: true,
+        escalation-type: escalation-type,
+        escalation-rate: escalation-rate,
+        escalation-interval: escalation-interval,
+        max-reward: max-reward,
+        escalation-fund: escalation-fund,
+        last-escalation-block: current-block
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (trigger-escalation (bounty-id uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (escalation-settings (unwrap! (map-get? bounty-escalation-settings { bounty-id: bounty-id }) err-escalation-not-enabled))
+      (current-block stacks-block-height)
+      (blocks-since-last (- current-block (get last-escalation-block escalation-settings)))
+      (current-reward (get reward-amount bounty))
+      (new-reward (calculate-escalated-reward current-reward escalation-settings))
+      (escalation-cost (- new-reward current-reward))
+    )
+    (asserts! (get escalation-enabled escalation-settings) err-escalation-not-enabled)
+    (asserts! (not (get solved bounty)) err-already-solved)
+    (asserts! (>= blocks-since-last (get escalation-interval escalation-settings)) err-invalid-escalation-params)
+    (asserts! (<= new-reward (get max-reward escalation-settings)) err-escalation-limit-reached)
+    (asserts! (>= (get escalation-fund escalation-settings) escalation-cost) err-insufficient-escalation-funds)
+    
+    ;; Update bounty reward
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { reward-amount: new-reward })
+    )
+    
+    ;; Update escalation settings
+    (map-set bounty-escalation-settings
+      { bounty-id: bounty-id }
+      (merge escalation-settings 
+        { 
+          escalation-fund: (- (get escalation-fund escalation-settings) escalation-cost),
+          last-escalation-block: current-block
+        })
+    )
+    
+    ;; Record escalation history
+    (map-set escalation-history
+      { bounty-id: bounty-id, escalation-number: (get-escalation-count bounty-id) }
+      {
+        previous-reward: current-reward,
+        new-reward: new-reward,
+        escalation-block: current-block,
+        escalation-type: (get escalation-type escalation-settings)
+      }
+    )
+    
+    (ok new-reward)
+  )
+)
+
+(define-public (add-escalation-funds (bounty-id uint) (additional-funds uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (escalation-settings (unwrap! (map-get? bounty-escalation-settings { bounty-id: bounty-id }) err-escalation-not-enabled))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    (asserts! (not (get solved bounty)) err-already-solved)
+    (asserts! (> additional-funds u0) err-invalid-amount)
+    (asserts! (>= (stx-get-balance tx-sender) additional-funds) err-insufficient-funds)
+    
+    (try! (stx-transfer? additional-funds tx-sender (as-contract tx-sender)))
+    
+    (map-set bounty-escalation-settings
+      { bounty-id: bounty-id }
+      (merge escalation-settings 
+        { escalation-fund: (+ (get escalation-fund escalation-settings) additional-funds) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (disable-escalation (bounty-id uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) err-not-found))
+      (escalation-settings (unwrap! (map-get? bounty-escalation-settings { bounty-id: bounty-id }) err-escalation-not-enabled))
+      (remaining-funds (get escalation-fund escalation-settings))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) err-unauthorized)
+    (asserts! (not (get solved bounty)) err-already-solved)
+    
+    ;; Return remaining escalation funds to creator
+    (if (> remaining-funds u0)
+      (try! (as-contract (stx-transfer? remaining-funds tx-sender (get creator bounty))))
+      true
+    )
+    
+    (map-set bounty-escalation-settings
+      { bounty-id: bounty-id }
+      (merge escalation-settings 
+        { 
+          escalation-enabled: false,
+          escalation-fund: u0
+        })
+    )
+    (ok remaining-funds)
+  )
+)
+
+(define-public (emergency-escalation-halt (bounty-id uint))
+  (let
+    (
+      (escalation-settings (unwrap! (map-get? bounty-escalation-settings { bounty-id: bounty-id }) err-escalation-not-enabled))
+      (remaining-funds (get escalation-fund escalation-settings))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    ;; Return remaining funds to bounty creator
+    (if (> remaining-funds u0)
+      (try! (as-contract (stx-transfer? remaining-funds tx-sender contract-owner)))
+      true
+    )
+    
+    (map-delete bounty-escalation-settings { bounty-id: bounty-id })
+    (ok remaining-funds)
+  )
+)
+
+(define-public (set-max-escalation-multiplier (new-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= new-multiplier u100) (<= new-multiplier u1000)) err-invalid-amount)
+    (var-set max-escalation-multiplier new-multiplier)
+    (ok true)
+  )
+)
+
+;; Private helper functions for escalation calculations
+(define-private (calculate-escalated-reward (current-reward uint) (settings (tuple (escalation-enabled bool) (escalation-type uint) (escalation-rate uint) (escalation-interval uint) (max-reward uint) (escalation-fund uint) (last-escalation-block uint))))
+  (let
+    (
+      (escalation-type (get escalation-type settings))
+      (escalation-rate (get escalation-rate settings))
+      (max-reward-cap (get max-reward settings))
+    )
+    (if (is-eq escalation-type escalation-linear)
+      ;; Linear escalation: current + (current * rate / 100)
+      (let ((new-reward (+ current-reward (/ (* current-reward escalation-rate) u100))))
+        (if (<= new-reward max-reward-cap) new-reward max-reward-cap))
+      (if (is-eq escalation-type escalation-exponential)
+        ;; Exponential escalation: current * (1 + rate/100)
+        (let ((new-reward (/ (* current-reward (+ u100 escalation-rate)) u100)))
+          (if (<= new-reward max-reward-cap) new-reward max-reward-cap))
+        ;; Stepped escalation: current + fixed amount based on rate
+        (let ((new-reward (+ current-reward (/ (* current-reward escalation-rate) u50))))
+          (if (<= new-reward max-reward-cap) new-reward max-reward-cap))
+      )
+    )
+  )
+)
+
+(define-private (get-escalation-count (bounty-id uint))
+  (let
+    (
+      (check-escalation-1 (map-get? escalation-history { bounty-id: bounty-id, escalation-number: u1 }))
+      (check-escalation-2 (map-get? escalation-history { bounty-id: bounty-id, escalation-number: u2 }))
+      (check-escalation-3 (map-get? escalation-history { bounty-id: bounty-id, escalation-number: u3 }))
+      (check-escalation-4 (map-get? escalation-history { bounty-id: bounty-id, escalation-number: u4 }))
+      (check-escalation-5 (map-get? escalation-history { bounty-id: bounty-id, escalation-number: u5 }))
+    )
+    (if (is-some check-escalation-5) u6
+      (if (is-some check-escalation-4) u5
+        (if (is-some check-escalation-3) u4
+          (if (is-some check-escalation-2) u3
+            (if (is-some check-escalation-1) u2
+              u1
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Read-only functions for escalation system
+(define-read-only (get-escalation-settings (bounty-id uint))
+  (map-get? bounty-escalation-settings { bounty-id: bounty-id })
+)
+
+(define-read-only (get-escalation-history (bounty-id uint) (escalation-number uint))
+  (map-get? escalation-history { bounty-id: bounty-id, escalation-number: escalation-number })
+)
+
+(define-read-only (is-escalation-due (bounty-id uint))
+  (match (map-get? bounty-escalation-settings { bounty-id: bounty-id })
+    settings
+      (if (get escalation-enabled settings)
+        (let
+          (
+            (current-block stacks-block-height)
+            (blocks-since-last (- current-block (get last-escalation-block settings)))
+            (interval (get escalation-interval settings))
+          )
+          (>= blocks-since-last interval)
+        )
+        false
+      )
+    false
+  )
+)
+
+(define-read-only (calculate-next-reward (bounty-id uint))
+  (match (map-get? bounties { bounty-id: bounty-id })
+    bounty
+      (match (map-get? bounty-escalation-settings { bounty-id: bounty-id })
+        settings
+          (if (get escalation-enabled settings)
+            (some (calculate-escalated-reward (get reward-amount bounty) settings))
+            none
+          )
+        none
+      )
+    none
+  )
+)
+
+(define-read-only (get-max-escalation-multiplier)
+  (var-get max-escalation-multiplier)
+)
+
+(define-read-only (get-escalation-stats (bounty-id uint))
+  (match (map-get? bounty-escalation-settings { bounty-id: bounty-id })
+    settings
+      (some {
+        escalation-enabled: (get escalation-enabled settings),
+        escalation-count: (- (get-escalation-count bounty-id) u1),
+        remaining-funds: (get escalation-fund settings),
+        next-escalation-due: (is-escalation-due bounty-id)
+      })
+    none
+  )
+)
+
+
+
+
+
