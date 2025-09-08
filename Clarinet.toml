@@ -1,0 +1,23 @@
+[project]
+name = 'Cryptofuse'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.Cryptofuse]
+path = 'contracts/Cryptofuse.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.BountyPool]
+path = 'contracts/BountyPool.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
